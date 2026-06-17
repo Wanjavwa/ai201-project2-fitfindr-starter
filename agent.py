@@ -18,6 +18,8 @@ Usage (once implemented):
     print(result["error"])   # None on success
 """
 
+import re
+
 from tools import search_listings, suggest_outfit, create_fit_card
 
 
@@ -92,16 +94,120 @@ def run_agent(query: str, wardrobe: dict) -> dict:
     Before writing code, complete the Planning Loop and State Management sections
     of planning.md — your implementation should match what you described there.
     """
-    # TODO: implement the planning loop
     session = _new_session(query, wardrobe)
-    session["error"] = "Planning loop not yet implemented."
+
+    # Step 2 — Parse the query into search parameters.
+    session["parsed"] = _parse_query(query)
+    parsed = session["parsed"]
+
+    # Step 3 — Search. This is the decision point of the planning loop:
+    # an empty result short-circuits the run before any styling happens.
+    session["search_results"] = search_listings(
+        description=parsed["description"],
+        size=parsed["size"],
+        max_price=parsed["max_price"],
+    )
+    if not session["search_results"]:
+        bits = [f"No listings matched \"{parsed['description'] or query}\""]
+        if parsed["size"]:
+            bits.append(f"in size {parsed['size']}")
+        if parsed["max_price"] is not None:
+            bits.append(f"under ${parsed['max_price']:.0f}")
+        session["error"] = (
+            " ".join(bits)
+            + ". Try removing the size filter, raising your budget, "
+            "or describing the item differently."
+        )
+        return session  # do NOT proceed to suggest_outfit with empty input
+
+    # Step 4 — Select the top (most relevant) result to carry forward.
+    session["selected_item"] = session["search_results"][0]
+
+    # Step 5 — Suggest an outfit for the selected item against the wardrobe.
+    session["outfit_suggestion"] = suggest_outfit(
+        new_item=session["selected_item"],
+        wardrobe=session["wardrobe"],
+    )
+
+    # Step 6 — Turn the outfit into a shareable fit card.
+    session["fit_card"] = create_fit_card(
+        outfit=session["outfit_suggestion"],
+        new_item=session["selected_item"],
+    )
+
+    # Step 7 — Return the completed session.
     return session
+
+
+# ── query parsing ──────────────────────────────────────────────────────────────
+
+# Recognized size tokens, longest first so "XXL" is matched before "XL"/"L".
+_SIZE_TOKENS = ["XXS", "XXL", "XS", "XL", "S", "M", "L"]
+
+
+def _parse_query(query: str) -> dict:
+    """
+    Extract a description, size, and max_price from a natural-language query.
+
+    Uses lightweight regex (no LLM) so parsing is deterministic and free:
+      - max_price: the first dollar amount after "under"/"below"/"$"
+      - size:      a standalone size token (e.g. "size M", "in M")
+      - description: the query with the price/size phrases stripped out
+
+    Returns a dict with keys: description (str), size (str|None), max_price (float|None).
+    """
+    text = query.strip()
+    lowered = text
+
+    # max_price — "under $30", "below 30", "$30", "30 dollars"
+    max_price = None
+    price_match = re.search(
+        r"(?:under|below|less than|max|<)?\s*\$?\s*(\d+(?:\.\d{1,2})?)\s*(?:dollars|usd)?",
+        lowered,
+        flags=re.IGNORECASE,
+    )
+    if price_match and re.search(r"(?:under|below|less than|max|<|\$)", lowered, re.IGNORECASE):
+        max_price = float(price_match.group(1))
+
+    # size — "size M", "in size 8", "size: L"
+    size = None
+    size_phrase = re.search(
+        r"\bsize[:\s]+([a-z0-9]+(?:\.\d)?)\b", lowered, flags=re.IGNORECASE
+    )
+    if size_phrase:
+        size = size_phrase.group(1).upper()
+    else:
+        # Fall back to a standalone letter-size token surrounded by spaces.
+        for tok in _SIZE_TOKENS:
+            if re.search(rf"\bsize\s+{tok}\b|\bin\s+{tok}\b", lowered, re.IGNORECASE):
+                size = tok
+                break
+
+    # description — strip the size/price phrases so they don't pollute keywords.
+    description = re.sub(
+        r"(?:under|below|less than|max)?\s*\$?\s*\d+(?:\.\d{1,2})?\s*(?:dollars|usd)?",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    description = re.sub(
+        r"\bsize[:\s]+[a-z0-9]+(?:\.\d)?\b", "", description, flags=re.IGNORECASE
+    ).strip()
+    description = re.sub(r"\s{2,}", " ", description)
+
+    return {"description": description, "size": size, "max_price": max_price}
 
 
 # ── CLI test ──────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    import sys
+
     from utils.data_loader import get_example_wardrobe, get_empty_wardrobe
+
+    # Fit cards contain emoji; make the console print them on Windows (cp1252).
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
 
     print("=== Happy path: graphic tee ===\n")
     session = run_agent(
